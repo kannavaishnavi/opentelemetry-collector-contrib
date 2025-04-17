@@ -14,8 +14,10 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/gogo/protobuf/proto"
+	"github.com/klauspost/compress/snappy"
 	promconfig "github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/labels"
+	promv1 "github.com/prometheus/prometheus/prompb"
 	writev2 "github.com/prometheus/prometheus/prompb/io/prometheus/write/v2"
 	promremote "github.com/prometheus/prometheus/storage/remote"
 	"go.opentelemetry.io/collector/component"
@@ -24,6 +26,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/receiver"
+	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/exp/metrics/identity"
@@ -60,6 +63,67 @@ type MetricIdentity struct {
 	Unit         string
 	Type         writev2.Metadata_MetricType
 }
+type CustomJSONMetric struct {
+	Labels    map[string]string `json:"labels"`
+	Name      string            `json:"name"`
+	Timestamp string            `json:"timestamp"`
+	Value     float64           `json:"value"`
+	Type      string
+}
+
+func ConvertCustomMetricsToOTLP(metric CustomJSONMetric) (pmetric.Metrics, error) {
+	md := pmetric.NewMetrics() // Create a new Metrics object
+
+	// Create ResourceMetrics (this will hold resource-level attributes)
+	resourceMetrics := md.ResourceMetrics().AppendEmpty()
+	resourceAttributes := resourceMetrics.Resource().Attributes()
+	resourceAttributes.PutStr("service.name", "custom-metrics-service") // Example attribute
+
+	// Create Metric and set its properties directly in ResourceMetrics
+	scopeMetrics := resourceMetrics.ScopeMetrics().AppendEmpty()
+	timestamp, err := time.Parse(time.RFC3339, metric.Timestamp)
+	if err != nil {
+		return md, fmt.Errorf("invalid timestamp format: %v", err)
+	}
+	// Create a Metric (Gauge type in this case)
+	metricData := scopeMetrics.Metrics().AppendEmpty()
+	metricData.SetName(metric.Name)
+	switch strings.ToLower(metric.Type) {
+	case "gauge":
+		metricData.SetEmptyGauge()
+		dp := metricData.Gauge().DataPoints().AppendEmpty()
+		dp.SetDoubleValue(metric.Value)
+		dp.SetTimestamp(pcommon.NewTimestampFromTime(timestamp))
+		for k, v := range metric.Labels {
+			dp.Attributes().PutStr(k, v)
+		}
+
+	case "counter":
+		metricData.SetEmptySum()
+		sum := metricData.Sum()
+		sum.SetIsMonotonic(true)
+		sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+		dp := sum.DataPoints().AppendEmpty()
+		dp.SetDoubleValue(metric.Value)
+		dp.SetTimestamp(pcommon.NewTimestampFromTime(timestamp))
+		for k, v := range metric.Labels {
+			dp.Attributes().PutStr(k, v)
+		}
+
+	default:
+		return md, fmt.Errorf("unsupported metric type: %s", metric.Type)
+	}
+	return md, nil
+}
+
+/* // convertStringToDouble converts a string value to a double.
+func convertStringToDouble(value string) (float64, error) {
+	val, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, fmt.Errorf("unable to convert value %s to double: %v", value, err)
+	}
+	return val, nil
+} */
 
 // createMetricIdentity creates a MetricIdentity struct from the required components
 func createMetricIdentity(resourceID, scopeName, scopeVersion, metricName, unit string, metricType writev2.Metadata_MetricType) MetricIdentity {
@@ -92,11 +156,10 @@ func (mi MetricIdentity) Hash() uint64 {
 func (prw *prometheusRemoteWriteReceiver) Start(ctx context.Context, host component.Host) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/write", prw.handlePRW)
-	var err error
 
-	prw.server, err = prw.config.ToServer(ctx, host, prw.settings.TelemetrySettings, mux)
-	if err != nil {
-		return fmt.Errorf("failed to create server definition: %w", err)
+	prw.server = &http.Server{
+		Addr:    ":8080", // or any other address you need
+		Handler: mux,
 	}
 	listener, err := prw.config.ToListener(ctx)
 	if err != nil {
@@ -140,37 +203,143 @@ func (prw *prometheusRemoteWriteReceiver) handlePRW(w http.ResponseWriter, req *
 		http.Error(w, err.Error(), http.StatusUnsupportedMediaType)
 		return
 	}
-	if msgType != promconfig.RemoteWriteProtoMsgV2 {
+	/* if msgType != promconfig.RemoteWriteProtoMsgV2 {
 		prw.settings.Logger.Warn("message received with unsupported proto version, rejecting")
 		http.Error(w, "Unsupported proto version", http.StatusUnsupportedMediaType)
 		return
 	}
-
+	*/
 	// After parsing the content-type header, the next step would be to handle content-encoding.
 	// Luckly confighttp's Server has middleware that already decompress the request body for us.
+	var decompressedData []byte
 
-	body, err := io.ReadAll(req.Body)
+	// First, we read the raw Snappy data into a buffer
+
+	rawData, err := io.ReadAll(req.Body)
+
 	if err != nil {
-		prw.settings.Logger.Warn("Error decoding remote write request", zapcore.Field{Key: "error", Type: zapcore.ErrorType, Interface: err})
+		prw.settings.Logger.Warn("Error reading request body", zap.Error(err))
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	var prw2Req writev2.Request
-	if err = proto.Unmarshal(body, &prw2Req); err != nil {
-		prw.settings.Logger.Warn("Error decoding remote write request", zapcore.Field{Key: "error", Type: zapcore.ErrorType, Interface: err})
+	// Use snappy.Decode to decompress the raw Snappy block
+	decompressedData, err = snappy.Decode(nil, rawData)
+
+	if err != nil {
+		prw.settings.Logger.Warn("Error decompressing Snappy body", zapcore.Field{Key: "error", Type: zapcore.ErrorType, Interface: err})
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	_, stats, err := prw.translateV2(req.Context(), &prw2Req)
-	stats.SetHeaders(w)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest) // Following instructions at https://prometheus.io/docs/specs/remote_write_spec_2_0/#invalid-samples
+	switch msgType {
+	case promconfig.RemoteWriteProtoMsgV2:
+		var prw2Req writev2.Request
+		if err := proto.Unmarshal(decompressedData, &prw2Req); err != nil {
+			prw.settings.Logger.Warn("Error decoding remote write request", zapcore.Field{Key: "error", Type: zapcore.ErrorType, Interface: err})
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+		otelMetrics, stats, err := prw.translateV2(req.Context(), &prw2Req)
+		stats.SetHeaders(w)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest) // Following instructions at https://prometheus.io/docs/specs/remote_write_spec_2_0/#invalid-samples
+			return
+		}
+		if prw.nextConsumer != nil {
+			if err := prw.nextConsumer.ConsumeMetrics(req.Context(), otelMetrics); err != nil {
+				prw.settings.Logger.Error("Failed to send metrics to next consumer", zapcore.Field{Key: "error", Type: zapcore.ErrorType, Interface: err})
+				http.Error(w, "Failed to process metrics", http.StatusInternalServerError)
+				return
+			}
+		}
+
+	case promconfig.RemoteWriteProtoMsgV1:
+		var prw1Req promv1.WriteRequest
+		if err := proto.Unmarshal(decompressedData, &prw1Req); err != nil {
+			prw.settings.Logger.Warn("Error decoding remote write request", zapcore.Field{Key: "error", Type: zapcore.ErrorType, Interface: err})
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+		customMetrics, stats, err := prw.translateV1(req.Context(), &prw1Req)
+		stats.SetHeaders(w)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if prw.nextConsumer != nil {
+			for _, metric := range customMetrics {
+				otlpMetric, err := ConvertCustomMetricsToOTLP(metric)
+				if err != nil {
+					prw.settings.Logger.Error("Failed to convert custom metric", zapcore.Field{Key: "error", Type: zapcore.ErrorType, Interface: err})
+					http.Error(w, "Failed to convert custom metric", http.StatusInternalServerError)
+					return
+				}
+				// Send each metric to the next consumer (this could be a Kafka exporter or anything else)
+				if err := prw.nextConsumer.ConsumeMetrics(req.Context(), otlpMetric); err != nil {
+					prw.settings.Logger.Error("Failed to send metrics to next consumer", zapcore.Field{Key: "error", Type: zapcore.ErrorType, Interface: err})
+					http.Error(w, "Failed to process metrics", http.StatusInternalServerError)
+					return
+				}
+			}
+		}
+	default:
+		http.Error(w, "Unsupported proto version", http.StatusUnsupportedMediaType)
 		return
 	}
 
+	fmt.Println("Received Prometheus V1 request successfully and passing on to next consumer ..")
 	w.WriteHeader(http.StatusNoContent)
+}
+func (prw *prometheusRemoteWriteReceiver) translateV1(_ context.Context, req *promv1.WriteRequest) ([]CustomJSONMetric, promremote.WriteResponseStats, error) {
+	var customMetrics []CustomJSONMetric
+	stats := promremote.WriteResponseStats{}
+
+	for _, ts := range req.Timeseries {
+		var metricName string
+		for _, label := range ts.Labels {
+			if label.Name == "__name__" {
+				metricName = label.Value
+				break
+			}
+		}
+		if metricName == "" {
+			continue
+		}
+		metricType := inferMetricType(metricName)
+
+		for _, sample := range ts.Samples {
+			tsTime := time.UnixMilli(sample.Timestamp).UTC()
+			customMetric := CustomJSONMetric{
+				Name:      metricName,
+				Value:     sample.Value,
+				Labels:    mapLabels(ts.Labels), // Create a map of other labels
+				Timestamp: tsTime.Format(time.RFC3339),
+				Type:      metricType,
+			}
+
+			customMetrics = append(customMetrics, customMetric)
+		}
+	}
+
+	return customMetrics, stats, nil
+}
+
+func inferMetricType(name string) string {
+	name = strings.ToLower(name)
+	if strings.HasSuffix(name, "_total") || strings.HasSuffix(name, "_count") {
+		return "counter"
+	}
+	return "gauge" // default fallback
+}
+
+func mapLabels(labels []promv1.Label) map[string]string {
+	labelMap := make(map[string]string)
+	for _, label := range labels {
+		if label.Name != "__name__" && label.Name != "job" && label.Name != "instance" {
+			labelMap[label.Name] = label.Value
+		}
+	}
+	return labelMap
 }
 
 // parseProto parses the content-type header and returns the version of the remote-write protocol.
@@ -208,6 +377,16 @@ func (prw *prometheusRemoteWriteReceiver) parseProto(contentType string) (promco
 //
 //nolint:unparam
 func (prw *prometheusRemoteWriteReceiver) translateV2(_ context.Context, req *writev2.Request) (pmetric.Metrics, promremote.WriteResponseStats, error) {
+	fmt.Println("Received Request:", req)
+
+	// Or print specific fields of the request for more detailed information
+	fmt.Println("Number of TimeSeries:", len(req.Timeseries))
+	for i, ts := range req.Timeseries {
+		fmt.Printf("TimeSeries %d: %+v\n", i, ts)
+	}
+
+	// Further print any other relevant data you want to inspect
+	fmt.Println("Symbols: ", req.Symbols)
 	var (
 		badRequestErrors error
 		otelMetrics      = pmetric.NewMetrics()
@@ -224,8 +403,9 @@ func (prw *prometheusRemoteWriteReceiver) translateV2(_ context.Context, req *wr
 
 	for _, ts := range req.Timeseries {
 		ls := ts.ToLabels(&labelsBuilder, req.Symbols)
+		fmt.Println("Labels:", ls)
 		if !ls.Has(labels.MetricName) {
-			badRequestErrors = errors.Join(badRequestErrors, errors.New("missing metric name in labels"))
+			badRequestErrors = errors.Join(badRequestErrors, fmt.Errorf("missing metric name in labels"))
 			continue
 		} else if duplicateLabel, hasDuplicate := ls.HasDuplicateLabelNames(); hasDuplicate {
 			badRequestErrors = errors.Join(badRequestErrors, fmt.Errorf("duplicate label %q in labels", duplicateLabel))
@@ -291,11 +471,12 @@ func (prw *prometheusRemoteWriteReceiver) translateV2(_ context.Context, req *wr
 		metric, exists := metricCache[metricKey]
 		// If the metric does not exist, we create an empty metric and add it to the cache.
 		if !exists {
+			fmt.Println("Creating new metric for key:", metricKey)
 			metric = scope.Metrics().AppendEmpty()
 			metric.SetName(metricName)
 			metric.SetUnit(unit)
 			metric.SetDescription(description)
-
+			fmt.Println("Type:", ts.Metadata.Type)
 			switch ts.Metadata.Type {
 			case writev2.Metadata_METRIC_TYPE_GAUGE:
 				metric.SetEmptyGauge()
@@ -307,6 +488,8 @@ func (prw *prometheusRemoteWriteReceiver) translateV2(_ context.Context, req *wr
 				metric.SetEmptyHistogram()
 			case writev2.Metadata_METRIC_TYPE_SUMMARY:
 				metric.SetEmptySummary()
+			default:
+				metric.SetEmptyGauge()
 			}
 
 			metricCache[metricKey] = metric
@@ -329,7 +512,16 @@ func (prw *prometheusRemoteWriteReceiver) translateV2(_ context.Context, req *wr
 		case writev2.Metadata_METRIC_TYPE_SUMMARY:
 			addSummaryDatapoints(metric.Summary().DataPoints(), ls, ts)
 		default:
-			badRequestErrors = errors.Join(badRequestErrors, fmt.Errorf("unsupported metric type %q for metric %q", ts.Metadata.Type, metricName))
+			dp := metric.Gauge().DataPoints().AppendEmpty()
+			dp.SetStartTimestamp(pcommon.Timestamp(ts.CreatedTimestamp * int64(time.Millisecond)))
+			dp.SetTimestamp(pcommon.Timestamp(ts.Samples[0].Timestamp * int64(time.Millisecond))) // Use the sample's timestamp
+			dp.SetDoubleValue(ts.Samples[0].Value)                                                // Set the value of the sample as the gauge value
+
+			// Set the labels as attributes of the datapoint
+			attributes := dp.Attributes()
+			for _, label := range ls {
+				attributes.PutStr(label.Name, label.Value)
+			}
 		}
 	}
 

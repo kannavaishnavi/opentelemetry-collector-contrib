@@ -25,7 +25,7 @@ func NewFactory() receiver.Factory {
 func createDefaultConfig() component.Config {
 	return &Config{
 		ServerConfig: confighttp.ServerConfig{
-			Endpoint: "localhost:9090",
+			Endpoint: "localhost:9464",
 		},
 	}
 }

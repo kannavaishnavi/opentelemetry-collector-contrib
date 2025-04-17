@@ -5,12 +5,13 @@ package kafkaexporter // import "github.com/open-telemetry/opentelemetry-collect
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
+	"time"
 
 	"github.com/IBM/sarama"
-	"go.opentelemetry.io/collector/client"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/exporter"
@@ -113,9 +114,6 @@ func (e *kafkaExporter[T]) exportData(ctx context.Context, data T) error {
 		saramaMessages := makeSaramaMessages(partitionMessages, e.messager.getTopic(ctx, data))
 		allSaramaMessages = append(allSaramaMessages, saramaMessages...)
 	}
-	messagesWithHeaders(allSaramaMessages, metadataToHeaders(
-		ctx, e.cfg.IncludeMetadataKeys,
-	))
 	if err := e.producer.SendMessages(allSaramaMessages); err != nil {
 		var prodErr sarama.ProducerErrors
 		if errors.As(err, &prodErr) {
@@ -131,12 +129,12 @@ func (e *kafkaExporter[T]) exportData(ctx context.Context, data T) error {
 func newTracesExporter(config Config, set exporter.Settings) *kafkaExporter[ptrace.Traces] {
 	// Jaeger encodings do their own partitioning, so disable trace ID
 	// partitioning when they are configured.
-	switch config.Traces.Encoding {
+	switch config.Encoding {
 	case "jaeger_proto", "jaeger_json":
 		config.PartitionTracesByID = false
 	}
 	return newKafkaExporter(config, set, func(host component.Host) (kafkaMessager[ptrace.Traces], error) {
-		marshaler, err := getTracesMarshaler(config.Traces.Encoding, host)
+		marshaler, err := getTracesMarshaler(config.Encoding, host)
 		if err != nil {
 			return nil, err
 		}
@@ -181,7 +179,7 @@ func (e *kafkaTracesMessager) partitionData(td ptrace.Traces) iter.Seq2[[]byte, 
 
 func newLogsExporter(config Config, set exporter.Settings) *kafkaExporter[plog.Logs] {
 	return newKafkaExporter(config, set, func(host component.Host) (kafkaMessager[plog.Logs], error) {
-		marshaler, err := getLogsMarshaler(config.Logs.Encoding, host)
+		marshaler, err := getLogsMarshaler(config.Encoding, host)
 		if err != nil {
 			return nil, err
 		}
@@ -224,7 +222,7 @@ func (e *kafkaLogsMessager) partitionData(ld plog.Logs) iter.Seq2[[]byte, plog.L
 
 func newMetricsExporter(config Config, set exporter.Settings) *kafkaExporter[pmetric.Metrics] {
 	return newKafkaExporter(config, set, func(host component.Host) (kafkaMessager[pmetric.Metrics], error) {
-		marshaler, err := getMetricsMarshaler(config.Metrics.Encoding, host)
+		marshaler, err := getMetricsMarshaler(config.Encoding, host)
 		if err != nil {
 			return nil, err
 		}
@@ -235,17 +233,95 @@ func newMetricsExporter(config Config, set exporter.Settings) *kafkaExporter[pme
 	})
 }
 
+func (e *kafkaMetricsMessager) getTopic(ctx context.Context, md pmetric.Metrics) string {
+	return getTopic(ctx, &e.config, md.ResourceMetrics())
+}
+
 type kafkaMetricsMessager struct {
 	config    Config
 	marshaler marshaler.MetricsMarshaler
 }
 
 func (e *kafkaMetricsMessager) marshalData(md pmetric.Metrics) ([]marshaler.Message, error) {
-	return e.marshaler.MarshalMetrics(md)
+	var messages []marshaler.Message
+
+	rmSlice := md.ResourceMetrics()
+	for i := 0; i < rmSlice.Len(); i++ {
+		rm := rmSlice.At(i)
+		resourceAttrs := attributesMapToMap(rm.Resource().Attributes())
+
+		smSlice := rm.ScopeMetrics()
+		for j := 0; j < smSlice.Len(); j++ {
+			sm := smSlice.At(j)
+			metrics := sm.Metrics()
+
+			for k := 0; k < metrics.Len(); k++ {
+				metric := metrics.At(k)
+
+				switch metric.Type() {
+				case pmetric.MetricTypeGauge:
+					dps := metric.Gauge().DataPoints()
+					for l := 0; l < dps.Len(); l++ {
+						dp := dps.At(l)
+						labels := mergeAttributes(resourceAttrs, attributesMapToMap(dp.Attributes()))
+						jsonMetric, err := buildJSONMetric(labels, metric.Name(), dp.Timestamp(), dp.DoubleValue())
+						if err != nil {
+							return nil, err
+						}
+						messages = append(messages, marshaler.Message{
+							Value: jsonMetric,
+						})
+					}
+				case pmetric.MetricTypeSum:
+					dps := metric.Sum().DataPoints()
+					for l := 0; l < dps.Len(); l++ {
+						dp := dps.At(l)
+						labels := mergeAttributes(resourceAttrs, attributesMapToMap(dp.Attributes()))
+						jsonMetric, err := buildJSONMetric(labels, metric.Name(), dp.Timestamp(), dp.DoubleValue())
+						if err != nil {
+							return nil, err
+						}
+						messages = append(messages, marshaler.Message{
+							Value: jsonMetric,
+						})
+					}
+					// Add other types as needed
+				}
+			}
+		}
+	}
+	return messages, nil
 }
 
-func (e *kafkaMetricsMessager) getTopic(ctx context.Context, md pmetric.Metrics) string {
-	return getTopic(ctx, &e.config, md.ResourceMetrics())
+func attributesMapToMap(attrs pcommon.Map) map[string]string {
+	m := make(map[string]string)
+	attrs.Range(func(k string, v pcommon.Value) bool {
+		m[k] = v.AsString()
+		return true
+	})
+	return m
+}
+
+func mergeAttributes(a, b map[string]string) map[string]string {
+	merged := make(map[string]string)
+	for k, v := range a {
+		merged[k] = v
+	}
+	for k, v := range b {
+		merged[k] = v
+	}
+	return merged
+}
+
+func buildJSONMetric(labels map[string]string, name string, ts pcommon.Timestamp, value float64) ([]byte, error) {
+	labels["__name__"] = name
+	m := map[string]interface{}{
+		"labels":    labels,
+		"name":      name,
+		"timestamp": time.Unix(0, int64(ts)).UTC().Format(time.RFC3339),
+		"value":     fmt.Sprintf("%g", value),
+	}
+	return json.Marshal(m)
 }
 
 func (e *kafkaMetricsMessager) partitionData(md pmetric.Metrics) iter.Seq2[[]byte, pmetric.Metrics] {
@@ -300,35 +376,4 @@ func makeSaramaMessages(messages []marshaler.Message, topic string) []*sarama.Pr
 		}
 	}
 	return saramaMessages
-}
-
-func messagesWithHeaders(msg []*sarama.ProducerMessage, h []sarama.RecordHeader) {
-	if len(h) == 0 || len(msg) == 0 {
-		return
-	}
-	for i := range msg {
-		if len(msg[i].Headers) == 0 {
-			msg[i].Headers = h
-			continue
-		}
-		msg[i].Headers = append(msg[i].Headers, h...)
-	}
-}
-
-func metadataToHeaders(ctx context.Context, keys []string) []sarama.RecordHeader {
-	if len(keys) == 0 {
-		return nil
-	}
-	info := client.FromContext(ctx)
-	headers := make([]sarama.RecordHeader, 0, len(keys))
-	for _, key := range keys {
-		valueSlice := info.Metadata.Get(key)
-		for _, v := range valueSlice {
-			headers = append(headers, sarama.RecordHeader{
-				Key:   []byte(key),
-				Value: []byte(v),
-			})
-		}
-	}
-	return headers
 }

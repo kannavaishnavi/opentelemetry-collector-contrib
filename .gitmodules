@@ -1,0 +1,2 @@
+[submodule "opentelemetry-collector-contrib"]
+	url = https://github.com/kannavaishnavi/opentelemetry-collector-contrib.git
